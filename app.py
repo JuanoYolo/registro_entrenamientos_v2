@@ -25,6 +25,28 @@ from pdf_utils import build_invoice_pdf
 
 st.set_page_config(page_title="Entrenos | Registro y cobros", page_icon="💪", layout="centered")
 
+# --- Código de acceso simple (opcional) ---
+import os
+
+# 1) Intenta leer de variables de entorno
+ACCESS_CODE = os.getenv("ACCESS_CODE", "")
+
+# 2) Si no hay, intenta leer de st.secrets (funciona en Streamlit Cloud o si tienes .streamlit/secrets.toml)
+if not ACCESS_CODE:
+    try:
+        ACCESS_CODE = st.secrets.get("ACCESS_CODE", "")
+    except Exception:
+        ACCESS_CODE = ""
+
+# 3) Pedir código si está configurado
+if ACCESS_CODE:
+    code = st.text_input("Código de acceso", type="password", placeholder="Ingresa el código")
+    if code != ACCESS_CODE:
+        st.stop()
+
+
+
+
 # ---------- Estado y backend ----------
 backend, backend_name = get_backend()
 
