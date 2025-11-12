@@ -25,24 +25,34 @@ from pdf_utils import build_invoice_pdf
 
 st.set_page_config(page_title="Entrenos | Registro y cobros", page_icon="💪", layout="centered")
 
-# --- Código de acceso simple (opcional) ---
+# --- Protección con código simple (para Cloud/local) ---
 import os
+import streamlit as st
 
-# 1) Intenta leer de variables de entorno
-ACCESS_CODE = os.getenv("ACCESS_CODE", "")
-
-# 2) Si no hay, intenta leer de st.secrets (funciona en Streamlit Cloud o si tienes .streamlit/secrets.toml)
-if not ACCESS_CODE:
+def require_access_code():
+    # 1) Preferir st.secrets en Cloud
+    code_secret = ""
     try:
-        ACCESS_CODE = st.secrets.get("ACCESS_CODE", "")
+        code_secret = st.secrets.get("ACCESS_CODE", "")
     except Exception:
-        ACCESS_CODE = ""
+        code_secret = ""
 
-# 3) Pedir código si está configurado
-if ACCESS_CODE:
-    code = st.text_input("Código de acceso", type="password", placeholder="Ingresa el código")
-    if code != ACCESS_CODE:
+    # 2) Fallback a variable de entorno
+    if not code_secret:
+        code_secret = os.getenv("ACCESS_CODE", "")
+
+    # (debug opcional) ver si está activo: quita esta línea al final
+    st.caption(f"Protección por código: {'ON' if code_secret else 'OFF'}")
+
+    if not code_secret:
+        return  # sin código configurado, no bloquea
+
+    user_code = st.text_input("Código de acceso", type="password", placeholder="Ingresa el código")
+    if user_code != code_secret:
         st.stop()
+
+require_access_code()
+
 
 
 
