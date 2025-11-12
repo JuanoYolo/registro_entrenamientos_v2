@@ -3,6 +3,8 @@ from datetime import datetime, date, time, timedelta
 from io import BytesIO
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+
 
 # --- compatibilidad rerun (Streamlit nuevo/antiguo) ---
 def _rerun():
@@ -421,6 +423,33 @@ with tab3:
 
         st.markdown(f"**Clases:** {len(items_cli)}  •  **Total:** {format_cop(total)}")
 
+        # --- Botón: Copiar método de pago/alias ---
+        pay_txt = f"{cli.get('payment_method','') or ''} · {cli.get('account','') or ''}".strip(" ·")
+        if pay_txt:
+            components.html(f"""
+            <button id="copyBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #444;cursor:pointer;">
+            Copiar método de pago
+            </button>
+            <span id="copyOk" style="margin-left:8px;color:#4ade80;display:none;">¡Copiado!</span>
+            <script>
+            const txt = {pay_txt.__repr__()};
+            const btn = document.getElementById("copyBtn");
+            if (btn) {{
+                btn.onclick = async () => {{
+                try {{
+                    await navigator.clipboard.writeText(txt);
+                    const ok = document.getElementById("copyOk");
+                    if (ok) {{
+                    ok.style.display = "inline";
+                    setTimeout(()=> ok.style.display="none", 1500);
+                    }}
+                }} catch(e) {{}}
+                }};
+            }}
+            </script>
+            """, height=40)
+
+
         if items_cli:
             # CSV detalle
             df_inv = pd.DataFrame([{"Fecha":it["fecha_str"], "Hora":it["hora"], "Valor":format_cop(it["amount_int"])} for it in items_cli])
@@ -463,3 +492,5 @@ with tab3:
                            file_name=f"clases_{st.session_state.month}_{st.session_state.year}.csv", mime="text/csv")
     else:
         st.caption("No hay clases en el mes para exportar.")
+
+
