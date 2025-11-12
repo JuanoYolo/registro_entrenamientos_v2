@@ -303,16 +303,15 @@ class SupabaseBackend(Backend):
         return resp[0]["id"]
 
     def list_sessions_between(self, start_iso, end_iso):
-        data = self._get("/sessions", params={
-            "select":"id,client_id,ts_iso,amount_int",
-            "ts_iso": f"gte.{start_iso}",
-            "ts_iso2": f"lt.{end_iso}",  # truco: algunos gateways no permiten dos veces misma key
-            # resolvemos abajo con filter en código si hace falta
-            "order":"ts_iso.asc"
-        })
-        # restricción lt end_iso en código
-        data = [d for d in data if d["ts_iso"] < end_iso]
-        # map nombres
+        # Filtro correcto con AND en PostgREST (rango: [start_iso, end_iso) )
+        params = {
+            "select": "id,client_id,ts_iso,amount_int",
+            "and": f"(ts_iso.gte.{start_iso},ts_iso.lt.{end_iso})",
+            "order": "ts_iso.asc",
+        }
+        data = self._get("/sessions", params=params)
+
+        # Mapear nombre del cliente
         cmap = {c["id"]: c for c in self.list_clients()}
         for d in data:
             d["client_name"] = cmap.get(d["client_id"], {}).get("name", "—")
@@ -346,12 +345,27 @@ class SupabaseBackend(Backend):
 
 
 def get_backend():
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_ANON_KEY")
+    import os
+    # intentar leer de st.secrets si existe, si no, de variables de entorno
+    url = None
+    key = None
+    try:
+        import streamlit as st
+        if "SUPABASE_URL" in st.secrets:
+            url = st.secrets["SUPABASE_URL"]
+        if "SUPABASE_ANON_KEY" in st.secrets:
+            key = st.secrets["SUPABASE_ANON_KEY"]
+    except Exception:
+        pass
+
+    url = url or os.getenv("SUPABASE_URL")
+    key = key or os.getenv("SUPABASE_ANON_KEY")
+
     if url and key:
         try:
             return SupabaseBackend(url, key), "Supabase"
         except Exception:
-            # Si falla (sin tablas o permisos), caemos a SQLite
+            # Si algo falla con Supabase, caemos a SQLite
             pass
     return SQLiteBackend(), "SQLite"
+
