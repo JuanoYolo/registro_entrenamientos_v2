@@ -1,506 +1,527 @@
-import os
-from datetime import datetime, date, time, timedelta
-from io import BytesIO
+# app.py
+# -----------------------------------------
+# Entrenamientos TyH — Registro simple
+# -----------------------------------------
+import io
+import json
+import math
+import datetime as dt
+from typing import List, Dict
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
 from auth import require_google_login, sign_out
-
-
-
-# --- compatibilidad rerun (Streamlit nuevo/antiguo) ---
-def _rerun():
-    
-    try:
-        st.rerun()  # versiones nuevas (1.27+)
-    except AttributeError:
-        # fallback para versiones antiguas
-        _rerun()
-
-
 from db import get_backend
-from utils import (
-    MESES_ES, MESES_ES_MAP, MESES_NUM_TO_ES,
-    PAGO_METODOS, DEFAULT_CLASE_COP,
-    normalize_name, name_norm_key, format_cop,
-    combine_date_time, ym_to_label
-)
-from pdf_utils import build_invoice_pdf
+from pdf_utils import build_invoice_pdf  # debe devolver bytes (PDF)
 
-st.set_page_config(page_title="Entrenos | Registro y cobros", page_icon="💪", layout="centered")
+# ---------------------------
+# Utilidades de formato/fechas
+# ---------------------------
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+]
+MES_TO_NUM = {m: i + 1 for i, m in enumerate(MESES_ES)}
 
-# --- Protección con código simple (para Cloud/local) ---
-import os
-import streamlit as st
-
-def require_access_code():
-    # 1) Preferir st.secrets en Cloud
-    code_secret = ""
+def format_cop(n: int) -> str:
     try:
-        code_secret = st.secrets.get("ACCESS_CODE", "")
+        v = int(n)
     except Exception:
-        code_secret = ""
+        return "$0"
+    s = f"{v:,}".replace(",", ".")
+    return f"${s}"
 
-    # 2) Fallback a variable de entorno
-    if not code_secret:
-        code_secret = os.getenv("ACCESS_CODE", "")
+def month_start_end(year: int, month: int):
+    start = dt.datetime(year, month, 1, 0, 0, 0)
+    if month == 12:
+        end = dt.datetime(year + 1, 1, 1, 0, 0, 0) - dt.timedelta(seconds=1)
+    else:
+        end = dt.datetime(year, month + 1, 1, 0, 0, 0) - dt.timedelta(seconds=1)
+    return start, end
 
-    # (debug opcional) ver si está activo: quita esta línea al final
-    st.caption(f"Protección por código: {'ON' if code_secret else 'OFF'}")
+def normalize_name(raw: str) -> str:
+    if not raw:
+        return ""
+    s = " ".join(raw.strip().split())
+    s = s.title()
+    return s
 
-    if not code_secret:
-        return  # sin código configurado, no bloquea
+def backend_name(b) -> str:
+    # best-effort label
+    return getattr(b, "label", None) or getattr(b, "name", None) or (
+        "Supabase" if "SUPABASE_URL" in st.secrets else "SQLite"
+    )
 
-    user_code = st.text_input("Código de acceso", type="password", placeholder="Ingresa el código")
-    if user_code != code_secret:
-        st.stop()
+# ---------------
+# Carga de datos
+# ---------------
+def load_clients(backend) -> List[Dict]:
+    try:
+        return backend.list_clients()  # [{'id','name','payment_method','account','phone','note'}]
+    except Exception as e:
+        st.error(f"No se pudieron cargar clientes: {e}")
+        return []
 
-require_access_code()
+def load_sessions_month(backend, year: int, month: int) -> List[Dict]:
+    start, end = month_start_end(year, month)
+    try:
+        items = backend.list_sessions_between(
+            start.isoformat(), end.isoformat()
+        )
+        # Se espera [{'id','client_id','client','ts_iso','amount_int'}]
+        return items
+    except Exception as e:
+        st.error(f"No se pudieron cargar clases del mes: {e}")
+        return []
 
+def monthly_summary(rows: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Cliente", "Clases", "Monto"])
+    # campos esperados: client (str) y amount_int (int)
+    df["Cliente"] = df.get("client", "")
+    df["Monto"] = df.get("amount_int", 0).astype(int)
+    grp = df.groupby("Cliente", dropna=False, as_index=False).agg(
+        Clases=("Cliente", "count"),
+        Monto=("Monto", "sum")
+    )
+    grp = grp.sort_values(["Cliente"]).reset_index(drop=True)
+    return grp
 
+def to_calendar(rows: List[Dict]) -> Dict[int, List[Dict]]:
+    cal = {d: [] for d in range(1, 32)}
+    for r in rows:
+        ts = r.get("ts_iso")
+        try:
+            dtm = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(None)
+        except Exception:
+            # best effort
+            dtm = dt.datetime.fromisoformat(ts[:19])
+        day = dtm.day
+        cal.setdefault(day, []).append(r | {"_dt": dtm})
+    return cal
+
+# ----------------
+# Export helpers
+# ----------------
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+# ----------------
+# UI components
+# ----------------
+def copy_payment_button(cli: Dict):
+    pay_txt = f"{cli.get('payment_method','') or ''} · {cli.get('account','') or ''}".strip(" ·")
+    if not pay_txt:
+        return
+    components.html(f"""
+    <button id="copyBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #444;cursor:pointer;">
+      Copiar método de pago
+    </button>
+    <span id="copyOk" style="margin-left:8px;color:#4ade80;display:none;">¡Copiado!</span>
+    <script>
+      const txt = {pay_txt.__repr__()};
+      const btn = document.getElementById("copyBtn");
+      if (btn) {{
+        btn.onclick = async () => {{
+          try {{
+            await navigator.clipboard.writeText(txt);
+            const ok = document.getElementById("copyOk");
+            if (ok) {{
+              ok.style.display = "inline";
+              setTimeout(()=> ok.style.display = "none", 1500);
+            }}
+          }} catch (e) {{}}
+        }};
+      }}
+    </script>
+    """, height=40)
+
+# =========================
+#  APP
+# =========================
+st.set_page_config(page_title="Entrenamientos TyH", page_icon="💪", layout="wide")
+
+# --- Gate de Google + allowlist (sin código de acceso) ---
 user = require_google_login()
 if not user:
-    st.stop()  # no avanzamos hasta que entre con Google
+    st.stop()
 
-# (opcional) mostrar email y botón salir
-st.sidebar.write(f"Sesión: {user['email']}")
+allowed = [e.strip().lower() for e in st.secrets.get("ALLOWED_EMAILS", "").split(",") if e.strip()]
+if allowed and user["email"].lower() not in allowed:
+    st.error("Tu correo no tiene acceso. Pide que te agreguen a la lista.")
+    if st.sidebar.button("Salir"):
+        sign_out()
+    st.stop()
+
+st.sidebar.success(f"Sesión: {user['email']}")
 if st.sidebar.button("Salir de Google"):
     sign_out()
 
+# --- Backend ---
+backend = get_backend()
+st.caption(f"Backend activo: **{backend_name(backend)}** • Moneda: **COP** • Formato: **$30.000**")
 
+# --- Parámetros Año/Mes (query params para persistir) ---
+now = dt.datetime.now()
+qp = st.query_params
+try:
+    q_year = int(qp.get("y")) if qp.get("y") else now.year
+except Exception:
+    q_year = now.year
+q_month_name = qp.get("m") if qp.get("m") in MESES_ES else MESES_ES[now.month - 1]
 
-# ---------- Estado y backend ----------
-backend, backend_name = get_backend()
+colA, colB = st.columns([1, 2])
+with colA:
+    year = st.number_input("Año", min_value=2020, max_value=2100, step=1, value=q_year)
+with colB:
+    mes_name = st.selectbox("Mes", MESES_ES, index=MESES_ES.index(q_month_name))
 
-if "year" not in st.session_state:
-    today = datetime.now()
-    st.session_state.year = today.year
-    st.session_state.month = today.month
-if "pending_delete_session" not in st.session_state:
-    st.session_state.pending_delete_session = None
-if "pending_delete_client" not in st.session_state:
-    st.session_state.pending_delete_client = None
+# Persistimos en URL
+st.query_params.update({"y": str(year), "m": mes_name})
+month = MES_TO_NUM[mes_name]
 
-st.markdown(
-    """
-    <style>
-      /* Inputs un poco más grandes para móvil */
-      .stTextInput input, .stNumberInput input, .stDateInput input, .stTimeInput input, .stSelectbox > div > div {
-         font-size: 18px !important;
-      }
-      .stButton>button {
-         font-size: 18px !important;
-         padding: 0.5rem 1rem;
-      }
-      .tiny { font-size: 12px; color: #666; }
-      .daybox {
-        border: 1px solid #e6e6e6; border-radius: 8px; padding: 8px; min-height: 110px;
-      }
-      .daytotal { text-align:right; font-weight: 600; margin-top:6px;}
-      .muted { color:#888; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.caption(f"Backend activo: **{backend_name}**  •  Moneda: **COP**  •  Formato: $30.000")
-
-# ---------- Helpers ----------
-def month_range(year:int, month:int):
-    start = datetime(year, month, 1)
-    if month == 12:
-        end = datetime(year+1, 1, 1)
-    else:
-        end = datetime(year, month+1, 1)
-    return start, end
-
-def load_sessions_month(year:int, month:int):
-    start, end = month_range(year, month)
-    items = backend.list_sessions_between(start.isoformat(), end.isoformat())
-    # enriquecer con fecha/hora muestran
-    for it in items:
-        ts = datetime.fromisoformat(it["ts_iso"])
-        it["fecha"] = ts.date()
-        it["hora"] = ts.strftime("%H:%M")
-        it["fecha_str"] = ts.strftime("%d/%m/%Y")
-        it["amount_str"] = format_cop(it["amount_int"])
-    return items
-
-def month_summary(year:int, month:int):
-    items = load_sessions_month(year, month)
-    df = pd.DataFrame(items)
-    if df.empty:
-        return pd.DataFrame(columns=["Cliente","Clases","Monto","Estado mes"])
-    grp = df.groupby("client_name").agg(Clases=("id","count"), Monto=("amount_int","sum")).reset_index()
-    # estado de pago por cliente
-    estados = []
-    # necesitamos ids: mapeo nombre->id
-    clients = {c["name"]: c for c in backend.list_clients()}
-    for _, row in grp.iterrows():
-        c = clients.get(row["client_name"])
-        est = backend.get_month_payment(c["id"], year, month) if c else dict(paid=False)
-        estados.append("Pagado" if est.get("paid") else "Pendiente")
-    grp["Monto"] = grp["Monto"].apply(format_cop)
-    grp.rename(columns={"client_name":"Cliente"}, inplace=True)
-    grp["Estado mes"] = estados
-    return grp
-
-def list_clients_simple():
-    return backend.list_clients()
-
-def ensure_client_exists(name_input, phone=None, method=None, account=None, note=None):
-    ex = backend.get_client_by_name_ci(name_input)
-    if ex:
-        return ex["id"], ex
-    # crear
-    cid = backend.add_client({
-        "name": name_input,
-        "phone": phone,
-        "payment_method": method,
-        "account": account,
-        "note": note
-    })
-    c = backend.get_client_by_name_ci(name_input)
-    return cid, c
-
-def csv_bytes_from_df(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-# ---------- Filtros globales Año/Mes ----------
-coly, colm = st.columns(2)
-with coly:
-    y = st.number_input("Año", min_value=2020, max_value=2100, value=st.session_state.year, step=1)
-with colm:
-    m_label = st.selectbox("Mes", options=[MESES_NUM_TO_ES[i] for i in range(1,13)], index=st.session_state.month-1)
-m = list(MESES_NUM_TO_ES.keys())[list(MESES_NUM_TO_ES.values()).index(m_label)]
-st.session_state.year, st.session_state.month = int(y), int(m)
-
-st.divider()
-
+# -------------
+# Tabs
+# -------------
 tab1, tab2, tab3 = st.tabs(["📋 Registro & Resumen", "📆 Calendario", "👥 Clientes & cobros"])
 
-# =========================================================
-# TAB 1: Registro & Resumen
-# =========================================================
+# ============
+# TAB 1: Registro y Resumen
+# ============
 with tab1:
     st.subheader("Registrar una clase")
 
-    clients = list_clients_simple()
-    client_names = [c["name"] for c in clients]
-    opts = ["(Escribir nombre nuevo)"] + client_names
-    sel = st.selectbox("Cliente", options=opts, index=0)
+    # --- Clientes: selector + opción de nuevo ---
+    clients = load_clients(backend)
+    names = ["(Escribir nombre nuevo)"] + [c.get("name", "") for c in clients]
+    sel = st.selectbox("Cliente", names, index=0)
     new_name = ""
     if sel == "(Escribir nombre nuevo)":
         new_name = st.text_input("Nuevo nombre", placeholder="Nombre y apellido")
-    value_int = st.number_input("Valor de la clase (COP)", min_value=0, max_value=10_000_000, value=DEFAULT_CLASE_COP, step=1000)
-    cold, colt = st.columns(2)
-    with cold:
-        d = st.date_input("Fecha", value=date.today(), format="DD/MM/YYYY")
-    with colt:
-        t = st.time_input("Hora", value=time(18,0), step=300)
+    valor = st.number_input("Valor de la clase (COP)", min_value=0, step=1000, value=30000)
+    c1, c2 = st.columns(2)
+    with c1:
+        f = st.date_input("Fecha", value=now.date())
+    with c2:
+        t = st.time_input("Hora", value=dt.time(hour=18, minute=0))
 
     if st.button("Guardar clase", use_container_width=True):
         try:
-            if sel == "(Escribir nombre nuevo)":
-                if not new_name.strip():
-                    st.error("Escribe el nombre del cliente.")
-                else:
-                    name_ok = normalize_name(new_name)
-                    cid, _c = ensure_client_exists(name_ok)
+            # 1) Resolver cliente
+            if sel != "(Escribir nombre nuevo)":
+                cli_name = normalize_name(sel)
+                cli = next((c for c in clients if normalize_name(c.get("name","")) == cli_name), None)
+                if not cli:
+                    # por si cambiaron lista; creamos
+                    backend.upsert_client(cli_name, None, None, None, None)
+                    clients = load_clients(backend)
+                    cli = next((c for c in clients if normalize_name(c.get("name","")) == cli_name), None)
             else:
-                cid = [c for c in clients if c["name"] == sel][0]["id"]
+                cli_name = normalize_name(new_name)
+                if not cli_name:
+                    st.warning("Escribe un nombre de cliente.")
+                    st.stop()
+                backend.upsert_client(cli_name, None, None, None, None)
+                clients = load_clients(backend)
+                cli = next((c for c in clients if normalize_name(c.get("name","")) == cli_name), None)
 
-            ts = combine_date_time(d, t).isoformat()
-            backend.log_session(cid, ts, int(value_int))
-            st.success("Clase registrada correctamente.")
+            client_id = cli.get("id") if cli else None
+
+            # 2) Timestamp y registro
+            ts = dt.datetime.combine(f, t)
+            ts_iso = ts.isoformat()
+
+            # diferentes firmas según tu db.py
+            try:
+                backend.add_session(client_id, ts_iso, int(valor))
+            except TypeError:
+                backend.add_session(cli_name, ts_iso, int(valor))
+
+            st.success("Clase registrada.")
         except Exception as e:
-            st.error(f"Ocurrió un error al guardar: {e}")
+            st.error(f"No se pudo guardar: {e}")
 
-    st.markdown("### Clases del mes: " + ym_to_label(st.session_state.year, st.session_state.month))
-    items = load_sessions_month(st.session_state.year, st.session_state.month)
+    st.markdown("---")
+    st.subheader(f"Clases del mes: {mes_name} {year}")
 
-    if items:
-        df = pd.DataFrame([{
-            "N°": i+1,
-            "ID": it["id"],
-            "Cliente": it["client_name"],
-            "Fecha": it["fecha_str"],
-            "Hora": it["hora"],
-            "Valor": it["amount_str"],
-        } for i,it in enumerate(items)])
-        st.dataframe(df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+    rows = load_sessions_month(backend, year, month)
 
-        # Borrado con confirmación
-        st.markdown("#### Borrar un registro")
-        cols = st.columns(3)
-        with cols[0]:
-            to_del = st.selectbox("Seleccione N° de la tabla", options=df["N°"].tolist())
-        sel_row = df[df["N°"]==to_del].iloc[0]
-        with cols[1]:
-            if st.button("🗑️ Marcar para borrar"):
-                st.session_state.pending_delete_session = int(sel_row["N°"])
-        with cols[2]:
-            if st.session_state.pending_delete_session == int(sel_row["N°"]):
-                if st.button("❗ Confirmar eliminación"):
-                    real_id = int(items[to_del-1]["id"])
+    # Tabla amigable
+    def _rows_to_df(_rows):
+        out = []
+        for i, r in enumerate(sorted(_rows, key=lambda x: x.get("ts_iso")), start=1):
+            ts = r.get("ts_iso")
+            try:
+                dtt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(None)
+            except Exception:
+                dtt = dt.datetime.fromisoformat(ts[:19])
+            out.append({
+                "N°": i,
+                "ID": r.get("id"),
+                "Cliente": r.get("client"),
+                "Fecha": dtt.strftime("%d/%m/%Y"),
+                "Hora": dtt.strftime("%H:%M"),
+                "Valor": format_cop(int(r.get("amount_int", 0))),
+            })
+        return pd.DataFrame(out)
+
+    df_mes = _rows_to_df(rows)
+    st.dataframe(df_mes.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+
+    col_d1, col_d2, col_d3 = st.columns(3)
+    with col_d1:
+        if not df_mes.empty:
+            st.download_button(
+                "⭳ Exportar clases del mes (CSV)",
+                data=df_to_csv_bytes(df_mes.drop(columns=["ID"])),
+                file_name=f"clases_{year}_{month:02d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    with col_d2:
+        if not df_mes.empty:
+            st.caption(f"Total clases: **{len(df_mes)}**")
+    with col_d3:
+        if not df_mes.empty:
+            total_mes = sum(int(r.get("amount_int", 0)) for r in rows)
+            st.caption(f"Total a cobrar: **{format_cop(total_mes)}**")
+
+    # Borrado (por ID)
+    if not df_mes.empty:
+        with st.expander("Borrar un registro"):
+            id_to_del = st.selectbox("Selecciona el N° de la fila a borrar", df_mes["N°"].tolist())
+            if st.button("Borrar", type="primary"):
+                try:
+                    real_id = df_mes.loc[df_mes["N°"] == id_to_del, "ID"].values[0]
                     backend.delete_session(real_id)
-                    st.session_state.pending_delete_session = None
-                    st.success("Registro eliminado.")
-                    _rerun()
-        # Exportar CSV
-        st.download_button("Descargar CSV (clases del mes)", data=csv_bytes_from_df(df.drop(columns=["ID"])), file_name="clases_mes.csv", mime="text/csv")
+                    st.success("Registro borrado.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo borrar: {e}")
+
+    st.markdown("---")
+    st.subheader(f"Resumen por persona (mes seleccionado)")
+
+    df_res = monthly_summary(rows)
+    if df_res.empty:
+        st.info("Sin clases registradas este mes.")
     else:
-        st.info("No hay clases registradas en este mes.")
+        df_show = df_res.copy()
+        df_show["Monto"] = df_show["Monto"].apply(format_cop)
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⭳ Exportar resumen (CSV)",
+            data=df_to_csv_bytes(df_res),
+            file_name=f"resumen_{year}_{month:02d}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-    st.markdown("### Resumen por persona (mes seleccionado)")
-    resumen = month_summary(st.session_state.year, st.session_state.month)
-    if not resumen.empty:
-        total_clases = resumen["Clases"].astype(int).sum()
-        total_monto = sum(int(str(v).replace("$","").replace(".","")) for v in resumen["Monto"])
-        st.dataframe(resumen, use_container_width=True, hide_index=True)
-        st.markdown(f"**Total de clases:** {total_clases}  •  **Total a cobrar:** {format_cop(total_monto)}")
-        st.download_button("Descargar CSV (resumen)", data=csv_bytes_from_df(resumen), file_name="resumen_mes.csv", mime="text/csv")
-    else:
-        st.info("Sin datos para el resumen en este mes.")
+    st.markdown("---")
+    st.subheader("Actualizar estado de pago mensual")
 
-    st.markdown("### Actualizar estado de pago mensual")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        cli_label = st.selectbox("Cliente", options=[c["name"] for c in clients] or ["—"])
-    with col2:
-        yy = st.number_input("Año", min_value=2020, max_value=2100, value=st.session_state.year, step=1, key="pay_year")
-    with col3:
-        mm_label = st.selectbox("Mes", options=MESES_ES, index=st.session_state.month-1, key="pay_month_label")
+    clients = load_clients(backend)
+    sel_cli = st.selectbox("Cliente", [c.get("name", "") for c in clients]) if clients else None
+    if sel_cli:
+        cli = next((c for c in clients if c.get("name","") == sel_cli), None)
+        client_id = cli.get("id") if cli else None
 
-    if clients:
-        cli_id = [c["id"] for c in clients if c["name"]==cli_label][0]
-        mm = MESES_ES_MAP[mm_label]
-        # total del cliente en ese mes
-        items_cli = [it for it in load_sessions_month(yy, mm) if it["client_id"]==cli_id]
-        total_cli = sum(it["amount_int"] for it in items_cli)
-        st.markdown(f"**Total del cliente en {mm_label} {yy}:** {format_cop(total_cli)}")
+        # total del cliente en el mes
+        total_cli = sum(int(r.get("amount_int", 0)) for r in rows if r.get("client") == sel_cli)
+        st.caption(f"Total del mes para **{sel_cli}**: {format_cop(total_cli)}")
 
-        state = backend.get_month_payment(cli_id, yy, mm)
-        paid_default = state.get("paid", False)
-        paid_on_default = state.get("paid_on_iso")
-        colp, cold = st.columns(2)
-        with colp:
-            paid_flag = st.checkbox("Pagado", value=paid_default)
-        with cold:
-            paid_on = st.date_input("Fecha de pago", value=date.fromisoformat(paid_on_default[:10]) if paid_on_default else date.today(), format="DD/MM/YYYY")
-        if st.button("Guardar estado de pago"):
-            backend.set_month_payment(cli_id, yy, mm, paid_flag, paid_on.isoformat() if paid_flag else None)
-            st.success("Estado de pago actualizado.")
+        paid = st.checkbox("Pagado")
+        paid_on = st.date_input("Fecha de pago", value=now.date())
+        if st.button("Guardar estado de pago", use_container_width=True):
+            try:
+                backend.set_month_payment(client_id, year, month, bool(paid), paid_on.isoformat() if paid else None)
+                st.success("Estado de pago actualizado.")
+            except Exception as e:
+                st.error(f"No se pudo actualizar: {e}")
 
-
-# =========================================================
+# ============
 # TAB 2: Calendario
-# =========================================================
+# ============
 with tab2:
-    st.subheader("Calendario mensual")
-    y, m = st.session_state.year, st.session_state.month
-    items = load_sessions_month(y, m)
+    st.subheader(f"Calendario — {mes_name.capitalize()} {year}")
+    rows = load_sessions_month(backend, year, month)
+    cal = to_calendar(rows)
 
-    # agrupar por día
-    by_day = {}
-    for it in items:
-        d = it["fecha"].day
-        by_day.setdefault(d, []).append(it)
+    # Render simple: semana Lun-Dom
+    start, _ = month_start_end(year, month)
+    first_weekday = (start.weekday())  # 0=Lun
+    days_in_month = max(d for d in cal.keys() if len(cal[d]) or True)
+    grid = []
+    week = [""] * first_weekday
+    for d in range(1, 32):
+        try:
+            dt.date(year, month, d)
+        except ValueError:
+            break
+        week.append(d)
+        if len(week) == 7:
+            grid.append(week)
+            week = []
+    if week:
+        week += [""] * (7 - len(week))
+        grid.append(week)
 
-    # construir semanas Lun-Dom
-    # primer día del mes
-    first = date(y, m, 1)
-    first_weekday = (first.weekday())  # 0=Mon ... 6=Sun
-    # total de días
-    if m == 12:
-        next_first = date(y+1,1,1)
-    else:
-        next_first = date(y, m+1, 1)
-    days_in_month = (next_first - first).days
-
-    # filas de semanas
-    day_ptr = 1
-    # primera fila
-    cols = st.columns(7)
-    for i in range(7):
-        with cols[i]:
-            if i < first_weekday:
-                st.markdown("&nbsp;", unsafe_allow_html=True)
-            else:
-                dnum = day_ptr
-                st.markdown(f"**{dnum}**")
-                if dnum in by_day:
-                    total_d = 0
-                    for it in by_day[dnum]:
-                        total_d += it["amount_int"]
-                        st.markdown(f"- {it['hora']} · {it['client_name']} · {format_cop(it['amount_int'])}")
-                    st.markdown(f"<div class='daytotal'>Total: {format_cop(total_d)}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<span class='muted'>—</span>", unsafe_allow_html=True)
-                day_ptr += 1
-                if day_ptr > days_in_month: break
-
-    # siguientes filas
-    while day_ptr <= days_in_month:
+    # Pintamos
+    for wk in grid:
         cols = st.columns(7)
-        for i in range(7):
+        for i, day in enumerate(wk):
             with cols[i]:
-                if day_ptr <= days_in_month:
-                    dnum = day_ptr
-                    st.markdown(f"**{dnum}**")
-                    if dnum in by_day:
-                        total_d = 0
-                        for it in by_day[dnum]:
-                            total_d += it["amount_int"]
-                            st.markdown(f"- {it['hora']} · {it['client_name']} · {format_cop(it['amount_int'])}")
-                        st.markdown(f"<div class='daytotal'>Total: {format_cop(total_d)}</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown("<span class='muted'>—</span>", unsafe_allow_html=True)
-                    day_ptr += 1
+                if day == "":
+                    st.write("")
+                    continue
+                st.markdown(f"**{day:02d}**")
+                items = sorted(cal.get(day, []), key=lambda r: r.get("ts_iso"))
+                tot_day = 0
+                for it in items:
+                    _dt = it.get("_dt")
+                    hhmm = _dt.strftime("%H:%M") if _dt else ""
+                    st.caption(f"{hhmm} · {it.get('client','')} · {format_cop(int(it.get('amount_int',0)))}")
+                    tot_day += int(it.get("amount_int", 0))
+                if tot_day:
+                    st.write(f"**Total día: {format_cop(tot_day)}**")
 
-
-# =========================================================
+# ============
 # TAB 3: Clientes & cobros
-# =========================================================
+# ============
 with tab3:
     st.subheader("Gestión de clientes")
 
-    clients = list_clients_simple()
-    names = [c["name"] for c in clients]
-    choice = st.selectbox("Seleccionar cliente (o crea uno nuevo)", options=["(Nuevo)"] + names)
-
-    if choice == "(Nuevo)":
-        cname = st.text_input("Nombre", placeholder="Nombre y apellido")
-        cphone = st.text_input("Teléfono (opcional)")
-        cmet = st.selectbox("Método de pago", options=PAGO_METODOS, index=0)
-        cacc = st.text_input("Cuenta/Alias", placeholder="Alias Nequi, cuenta, etc.")
-        cnote = st.text_input("Nota (opcional)")
-
-        if st.button("Crear cliente"):
-            if not cname.strip():
-                st.error("El nombre es obligatorio.")
-            else:
-                cid, _ = ensure_client_exists(cname, phone=cphone, method=cmet, account=cacc, note=cnote)
-                st.success("Cliente creado o ya existente (normalizado).")
-                _rerun()
+    clients = load_clients(backend)
+    df_cli = pd.DataFrame(clients)
+    if not df_cli.empty:
+        show = df_cli[["name", "phone", "payment_method", "account", "note"]].rename(columns={
+            "name":"Nombre", "phone":"Teléfono", "payment_method":"Método de pago",
+            "account":"Cuenta/Alias", "note":"Nota"
+        })
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⭳ Exportar clientes (CSV)",
+            data=df_to_csv_bytes(show),
+            file_name="clientes.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
-        cli = [c for c in clients if c["name"]==choice][0]
-        cname = st.text_input("Nombre", value=cli["name"])
-        cphone = st.text_input("Teléfono", value=cli.get("phone") or "")
-        cmet = st.selectbox("Método de pago", options=PAGO_METODOS, index=(PAGO_METODOS.index(cli["payment_method"]) if cli.get("payment_method") in PAGO_METODOS else 0))
-        cacc = st.text_input("Cuenta/Alias", value=cli.get("account") or "")
-        cnote = st.text_input("Nota", value=cli.get("note") or "")
+        st.info("Aún no tienes clientes.")
 
-        colu1, colu2 = st.columns(2)
-        with colu1:
-            if st.button("Guardar cambios"):
-                backend.update_client(cli["id"], {"name": cname, "phone": cphone, "payment_method": cmet, "account": cacc, "note": cnote})
-                st.success("Cliente actualizado.")
-                _rerun()
-        with colu2:
-            if st.button("🗑️ Borrar cliente"):
-                st.session_state.pending_delete_client = cli["id"]
-        if st.session_state.pending_delete_client == cli["id"]:
-            if st.button("❗ Confirmar eliminación del cliente y sus datos"):
-                backend.delete_client(cli["id"])
-                st.session_state.pending_delete_client = None
-                st.success("Cliente eliminado.")
-                _rerun()
+    st.markdown("---")
+    st.subheader("Crear/Editar cliente")
 
-    st.markdown("### Exportar clientes")
+    col1, col2 = st.columns(2)
+    with col1:
+        cli_name = st.text_input("Nombre (único, normalizado)", "")
+        phone = st.text_input("Teléfono (opcional)", "")
+        method = st.selectbox("Método de pago", ["", "Nequi", "Bancolombia", "Nu", "Lulo", "Otro"])
+    with col2:
+        account = st.text_input("Cuenta/Alias", "")
+        note = st.text_area("Nota (opcional)", "", height=80)
+
+    if st.button("Guardar cliente", use_container_width=True):
+        try:
+            backend.upsert_client(normalize_name(cli_name), phone or None, method or None, account or None, note or None)
+            st.success("Cliente guardado.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo guardar el cliente: {e}")
+
     if clients:
-        dfc = pd.DataFrame(clients)[["name","phone","payment_method","account","note","created_at"]]
-        st.download_button("Descargar CSV (clientes)", data=dfc.to_csv(index=False).encode("utf-8"), file_name="clientes.csv", mime="text/csv")
-    else:
-        st.caption("No hay clientes aún.")
+        with st.expander("Borrar cliente"):
+            del_name = st.selectbox("Selecciona el cliente a borrar", [c.get("name","") for c in clients])
+            if st.button("Borrar cliente definitivamente", type="primary"):
+                try:
+                    cli = next((c for c in clients if c.get("name","")==del_name), None)
+                    backend.delete_client(cli.get("id"))
+                    st.success("Cliente borrado.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo borrar: {e}")
 
-    st.divider()
-    st.subheader("Generar cuenta de cobro (por cliente y mes)")
+    st.markdown("---")
+    st.subheader("Generar cuenta de cobro mensual")
 
-    clients = list_clients_simple()
+    clients = load_clients(backend)
     if not clients:
-        st.info("Primero crea un cliente.")
+        st.info("Primero crea clientes.")
     else:
-        csel = st.selectbox("Cliente", options=[c["name"] for c in clients], key="inv_cli")
-        yy = st.number_input("Año", min_value=2020, max_value=2100, value=st.session_state.year, step=1, key="inv_y")
-        mlabel = st.selectbox("Mes", options=MESES_ES, index=st.session_state.month-1, key="inv_m")
-        mm = MESES_ES_MAP[mlabel]
-        cli = [c for c in clients if c["name"]==csel][0]
-        # clases del mes por cliente
-        items_all = load_sessions_month(yy, mm)
-        items_cli = [it for it in items_all if it["client_id"]==cli["id"]]
-        total = sum(it["amount_int"] for it in items_cli)
+        ccol1, ccol2, ccol3 = st.columns(3)
+        with ccol1:
+            cli_name = st.selectbox("Cliente", [c.get("name","") for c in clients])
+        with ccol2:
+            inv_year = st.number_input("Año", min_value=2020, max_value=2100, value=year, step=1)
+        with ccol3:
+            inv_mes_name = st.selectbox("Mes", MESES_ES, index=MESES_ES.index(mes_name), key="mes_invoice")
 
-        st.markdown(f"**Clases:** {len(items_cli)}  •  **Total:** {format_cop(total)}")
+        inv_month = MES_TO_NUM[inv_mes_name]
+        # datos cliente
+        cli = next((c for c in clients if c.get("name","")==cli_name), None)
+        if cli:
+            st.caption(f"Método: **{cli.get('payment_method','')}** — Cuenta/Alias: **{cli.get('account','')}**")
+            copy_payment_button(cli)
 
-        # --- Botón: Copiar método de pago/alias ---
-        pay_txt = f"{cli.get('payment_method','') or ''} · {cli.get('account','') or ''}".strip(" ·")
-        if pay_txt:
-            components.html(f"""
-            <button id="copyBtn" style="padding:8px 12px;border-radius:8px;border:1px solid #444;cursor:pointer;">
-            Copiar método de pago
-            </button>
-            <span id="copyOk" style="margin-left:8px;color:#4ade80;display:none;">¡Copiado!</span>
-            <script>
-            const txt = {pay_txt.__repr__()};
-            const btn = document.getElementById("copyBtn");
-            if (btn) {{
-                btn.onclick = async () => {{
-                try {{
-                    await navigator.clipboard.writeText(txt);
-                    const ok = document.getElementById("copyOk");
-                    if (ok) {{
-                    ok.style.display = "inline";
-                    setTimeout(()=> ok.style.display="none", 1500);
-                    }}
-                }} catch(e) {{}}
-                }};
-            }}
-            </script>
-            """, height=40)
-
+        # sesiones del mes/cliente
+        all_rows = load_sessions_month(backend, inv_year, inv_month)
+        items_cli = [r for r in all_rows if r.get("client")==cli_name]
+        det = []
+        total = 0
+        for r in sorted(items_cli, key=lambda x: x.get("ts_iso")):
+            ts = r.get("ts_iso")
+            try:
+                dtt = dt.datetime.fromisoformat(ts.replace("Z","+00:00")).astimezone(None)
+            except Exception:
+                dtt = dt.datetime.fromisoformat(ts[:19])
+            det.append({"fecha": dtt.strftime("%d/%m/%Y"), "hora": dtt.strftime("%H:%M"), "valor": int(r.get("amount_int",0))})
+            total += int(r.get("amount_int",0))
 
         if items_cli:
+            st.write(f"Total clases: **{len(items_cli)}** — Total a cobrar: **{format_cop(total)}**")
             # CSV detalle
-            df_inv = pd.DataFrame([{"Fecha":it["fecha_str"], "Hora":it["hora"], "Valor":format_cop(it["amount_int"])} for it in items_cli])
-            st.download_button("Descargar CSV (cuenta de cobro)", data=df_inv.to_csv(index=False).encode("utf-8"),
-                               file_name=f"cuenta_{cli['name']}_{mlabel}_{yy}.csv", mime="text/csv")
+            df_det = pd.DataFrame([{"Fecha":d["fecha"], "Hora":d["hora"], "Valor":format_cop(d["valor"])} for d in det])
+            st.download_button(
+                "⭳ Descargar detalle (CSV)",
+                data=df_to_csv_bytes(df_det),
+                file_name=f"cuenta_{cli_name}_{inv_year}_{inv_month:02d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
-            # PDF
-            datos_pdf = {
-                "cliente": {
-                    "name": cli["name"],
-                    "phone": cli.get("phone"),
-                    "payment_method": cli.get("payment_method"),
-                    "account": cli.get("account"),
-                    "note": cli.get("note"),
-                },
-                "year": int(yy),
-                "month": int(mm),
-                "clases": [{"fecha_str": it["fecha_str"], "hora_str": it["hora"], "valor_int": it["amount_int"]} for it in items_cli],
-                "total_int": int(total),
-                "hoy_str": datetime.now().strftime("%d/%m/%Y")
-            }
-            pdf_bytes = build_invoice_pdf(datos_pdf)
-            st.download_button("Descargar PDF (cuenta de cobro)", data=pdf_bytes,
-                               file_name=f"cuenta_{cli['name']}_{mlabel}_{yy}.pdf", mime="application/pdf")
+            # PDF cuenta (plantilla simple en pdf_utils.build_invoice_pdf)
+            if st.button("⭳ Descargar cuenta de cobro (PDF)", use_container_width=True):
+                try:
+                    invoice = {
+                        "client": cli_name,
+                        "year": inv_year,
+                        "month": inv_month,
+                        "month_name": inv_mes_name,
+                        "items": det,
+                        "total": total,
+                        "method": cli.get("payment_method",""),
+                        "account": cli.get("account",""),
+                        "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                    try:
+                        pdf_bytes = build_invoice_pdf(invoice)  # firma recomendada
+                    except TypeError:
+                        # fallback si tu pdf_utils usa parámetros separados
+                        pdf_bytes = build_invoice_pdf(
+                            cli_name, inv_year, inv_month, det, total,
+                            cli.get("payment_method",""), cli.get("account","")
+                        )
+                    st.download_button(
+                        "Descargar PDF",
+                        data=pdf_bytes,
+                        file_name=f"cuenta_{cli_name}_{inv_year}_{inv_month:02d}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"No se pudo generar el PDF: {e}")
         else:
-            st.caption("No hay clases para ese cliente en el mes seleccionado.")
-
-    st.divider()
-    st.subheader("Exportar vistas")
-    # Clases del mes (todas)
-    items_all = load_sessions_month(st.session_state.year, st.session_state.month)
-    if items_all:
-        df_all = pd.DataFrame([{
-            "Cliente": it["client_name"],
-            "Fecha": it["fecha_str"],
-            "Hora": it["hora"],
-            "Valor": format_cop(it["amount_int"])
-        } for it in items_all])
-        st.download_button("CSV: clases del mes (todas)", data=df_all.to_csv(index=False).encode("utf-8"),
-                           file_name=f"clases_{st.session_state.month}_{st.session_state.year}.csv", mime="text/csv")
-    else:
-        st.caption("No hay clases en el mes para exportar.")
-
-
+            st.info("Ese cliente no tiene clases registradas en el mes seleccionado.")
