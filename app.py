@@ -4,6 +4,8 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from auth import require_google_login, sign_out
+
 
 
 # --- compatibilidad rerun (Streamlit nuevo/antiguo) ---
@@ -56,6 +58,14 @@ def require_access_code():
 require_access_code()
 
 
+user = require_google_login()
+if not user:
+    st.stop()  # no avanzamos hasta que entre con Google
+
+# (opcional) mostrar email y botón salir
+st.sidebar.write(f"Sesión: {user['email']}")
+if st.sidebar.button("Salir de Google"):
+    sign_out()
 
 
 
