@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from auth import require_google_login, sign_out
+from auth import require_login, sign_out
 from db import get_backend
 from pdf_utils import build_invoice_pdf  # debe devolver bytes (PDF)
 
@@ -144,21 +144,15 @@ def copy_payment_button(cli: Dict):
 # =========================
 st.set_page_config(page_title="Entrenamientos TyH", page_icon="💪", layout="wide")
 
-# --- Gate de Google + allowlist (sin código de acceso) ---
-user = require_google_login()
+# --- Gate simple con código de acceso ---
+user = require_login()
 if not user:
     st.stop()
 
-allowed = [e.strip().lower() for e in st.secrets.get("ALLOWED_EMAILS", "").split(",") if e.strip()]
-if allowed and user["email"].lower() not in allowed:
-    st.error("Tu correo no tiene acceso. Pide que te agreguen a la lista.")
-    if st.sidebar.button("Salir"):
-        sign_out()
-    st.stop()
-
 st.sidebar.success(f"Sesión: {user['email']}")
-if st.sidebar.button("Salir de Google"):
+if st.sidebar.button("Salir"):
     sign_out()
+
 
 # --- Backend ---
 backend = get_backend()
@@ -269,7 +263,8 @@ with tab1:
         return pd.DataFrame(out)
 
     df_mes = _rows_to_df(rows)
-    st.dataframe(df_mes.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+    st.dataframe(df_mes.drop(columns=["ID"], errors="ignore"), use_container_width=True,hide_index=True)
+
 
     col_d1, col_d2, col_d3 = st.columns(3)
     with col_d1:

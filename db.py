@@ -10,6 +10,7 @@ from utils import name_norm_key, normalize_name, DEFAULT_CLASE_COP
 # Interfaz común
 # ======================================================
 
+
 class Backend:
     def list_clients(self):
         raise NotImplementedError
@@ -39,6 +40,17 @@ class Backend:
         raise NotImplementedError
 
     def set_month_payment(self, client_id, year, month, paid: bool, paid_on_iso: str | None):
+        raise NotImplementedError
+
+    def upsert_client(self, name, phone, payment_method, account, note):
+        """Crear o actualizar un cliente por nombre (case-insensitive)."""
+        raise NotImplementedError
+
+    def add_session(self, client, ts_iso, amount_int):
+        """
+        Compatibilidad con app.py:
+        - client puede ser ID (int) o nombre (str).
+        """
         raise NotImplementedError
 
 
@@ -110,16 +122,41 @@ class SQLiteBackend(Backend):
     # ---- clients ----
     def list_clients(self):
         with self._conn() as con:
-            rows = con.execute("SELECT id,name,phone,payment_method,account,note,created_at FROM clients ORDER BY name").fetchall()
-        return [dict(id=r[0], name=r[1], phone=r[2], payment_method=r[3], account=r[4], note=r[5], created_at=r[6]) for r in rows]
+            rows = con.execute(
+                "SELECT id,name,phone,payment_method,account,note,created_at "
+                "FROM clients ORDER BY name"
+            ).fetchall()
+        return [
+            dict(
+                id=r[0],
+                name=r[1],
+                phone=r[2],
+                payment_method=r[3],
+                account=r[4],
+                note=r[5],
+                created_at=r[6],
+            )
+            for r in rows
+        ]
 
     def get_client_by_name_ci(self, name):
         key = name_norm_key(name)
         with self._conn() as con:
-            r = con.execute("SELECT id,name,phone,payment_method,account,note FROM clients WHERE name_norm=?", (key,)).fetchone()
+            r = con.execute(
+                "SELECT id,name,phone,payment_method,account,note "
+                "FROM clients WHERE name_norm=?",
+                (key,),
+            ).fetchone()
         if not r:
             return None
-        return dict(id=r[0], name=r[1], phone=r[2], payment_method=r[3], account=r[4], note=r[5])
+        return dict(
+            id=r[0],
+            name=r[1],
+            phone=r[2],
+            payment_method=r[3],
+            account=r[4],
+            note=r[5],
+        )
 
     def add_client(self, data):
         name = normalize_name(data["name"])
@@ -127,14 +164,28 @@ class SQLiteBackend(Backend):
         now = datetime.utcnow().isoformat()
         with self._conn() as con:
             try:
-                cur = con.execute("""
-                  INSERT INTO clients(name,name_norm,phone,payment_method,account,note,created_at)
-                  VALUES (?,?,?,?,?,?,?)
-                """, (name, key, data.get("phone"), data.get("payment_method"), data.get("account"), data.get("note"), now))
+                cur = con.execute(
+                    """
+                    INSERT INTO clients(name,name_norm,phone,payment_method,account,note,created_at)
+                    VALUES (?,?,?,?,?,?,?)
+                    """,
+                    (
+                        name,
+                        key,
+                        data.get("phone"),
+                        data.get("payment_method"),
+                        data.get("account"),
+                        data.get("note"),
+                        now,
+                    ),
+                )
                 con.commit()
                 return cur.lastrowid
             except sqlite3.IntegrityError:
-                r = con.execute("SELECT id FROM clients WHERE name_norm=?", (key,)).fetchone()
+                r = con.execute(
+                    "SELECT id FROM clients WHERE name_norm=?",
+                    (key,),
+                ).fetchone()
                 return r[0] if r else None
 
     def update_client(self, client_id, data):
@@ -151,8 +202,31 @@ class SQLiteBackend(Backend):
             return
         vals.append(client_id)
         with self._conn() as con:
-            con.execute(f"UPDATE clients SET {','.join(sets)} WHERE id=?", tuple(vals))
+            con.execute(
+                f"UPDATE clients SET {','.join(sets)} WHERE id=?",
+                tuple(vals),
+            )
             con.commit()
+
+    def upsert_client(self, name, phone, payment_method, account, note):
+        """
+        Si el cliente existe (por name_norm), lo actualiza.
+        Si no existe, lo crea.
+        Devuelve el id del cliente.
+        """
+        existing = self.get_client_by_name_ci(name)
+        data = {
+            "name": name,
+            "phone": phone,
+            "payment_method": payment_method,
+            "account": account,
+            "note": note,
+        }
+        if existing:
+            self.update_client(existing["id"], data)
+            return existing["id"]
+        else:
+            return self.add_client(data)
 
     def delete_client(self, client_id):
         with self._conn() as con:
@@ -172,17 +246,46 @@ class SQLiteBackend(Backend):
             con.commit()
             return cur.lastrowid
 
+    def add_session(self, client, ts_iso, amount_int):
+        """
+        client puede ser:
+        - int: id del cliente
+        - str: nombre del cliente (se crea si no existe)
+        """
+        if isinstance(client, int):
+            client_id = client
+        else:
+            # Buscar por nombre; si no existe, crear
+            existing = self.get_client_by_name_ci(client)
+            if existing:
+                client_id = existing["id"]
+            else:
+                client_id = self.add_client({"name": client})
+
+        return self.log_session(client_id, ts_iso, amount_int)
+
     def list_sessions_between(self, start_iso, end_iso):
         with self._conn() as con:
-            rows = con.execute("""
-              SELECT s.id, s.client_id, c.name, s.ts_iso, s.amount_int
-              FROM sessions s JOIN clients c ON c.id=s.client_id
-              WHERE s.ts_iso >= ? AND s.ts_iso < ?
-              ORDER BY s.ts_iso ASC
-            """, (start_iso, end_iso)).fetchall()
+            rows = con.execute(
+                """
+                SELECT s.id, s.client_id, c.name, s.ts_iso, s.amount_int
+                FROM sessions s JOIN clients c ON c.id=s.client_id
+                WHERE s.ts_iso >= ? AND s.ts_iso < ?
+                ORDER BY s.ts_iso ASC
+                """,
+                (start_iso, end_iso),
+            ).fetchall()
         out = []
         for r in rows:
-            out.append(dict(id=r[0], client_id=r[1], client_name=r[2], ts_iso=r[3], amount_int=r[4]))
+            out.append(
+                dict(
+                    id=r[0],
+                    client_id=r[1],
+                    client=r[2],
+                    ts_iso=r[3],
+                    amount_int=r[4],
+                )
+            )
         return out
 
     def delete_session(self, session_id):
@@ -193,22 +296,28 @@ class SQLiteBackend(Backend):
     # ---- monthly payments ----
     def get_month_payment(self, client_id, year, month):
         with self._conn() as con:
-            r = con.execute("""
-              SELECT paid, paid_on_iso FROM monthly_payments
-              WHERE client_id=? AND year=? AND month=?
-            """, (client_id, year, month)).fetchone()
+            r = con.execute(
+                """
+                SELECT paid, paid_on_iso FROM monthly_payments
+                WHERE client_id=? AND year=? AND month=?
+                """,
+                (client_id, year, month),
+            ).fetchone()
         if not r:
             return dict(paid=False, paid_on_iso=None)
         return dict(paid=bool(r[0]), paid_on_iso=r[1])
 
     def set_month_payment(self, client_id, year, month, paid: bool, paid_on_iso: str | None):
         with self._conn() as con:
-            con.execute("""
-              INSERT INTO monthly_payments(client_id,year,month,paid,paid_on_iso)
-              VALUES(?,?,?,?,?)
-              ON CONFLICT(client_id,year,month) DO UPDATE SET
-                paid=excluded.paid, paid_on_iso=excluded.paid_on_iso
-            """, (client_id, year, month, int(bool(paid)), paid_on_iso))
+            con.execute(
+                """
+                INSERT INTO monthly_payments(client_id,year,month,paid,paid_on_iso)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(client_id,year,month) DO UPDATE SET
+                  paid=excluded.paid, paid_on_iso=excluded.paid_on_iso
+                """,
+                (client_id, year, month, int(bool(paid)), paid_on_iso),
+            )
             con.commit()
 
 
@@ -258,7 +367,13 @@ class SupabaseBackend(Backend):
         headers = dict(self.headers)
         if prefer:
             headers["Prefer"] = prefer
-        r = requests.patch(self.base + path, headers=headers, params=params, data=json.dumps(data), timeout=20)
+        r = requests.patch(
+            self.base + path,
+            headers=headers,
+            params=params,
+            data=json.dumps(data),
+            timeout=20,
+        )
         r.raise_for_status()
         return r.json() if r.text else None
 
@@ -273,7 +388,7 @@ class SupabaseBackend(Backend):
     def list_clients(self):
         params = {
             "select": "id,name,phone,payment_method,account,note,created_at",
-            "order": "name.asc"
+            "order": "name.asc",
         }
         if self.owner_email:
             params["owner_email"] = f"eq.{self.owner_email}"
@@ -298,7 +413,7 @@ class SupabaseBackend(Backend):
             "account": data.get("account"),
             "note": data.get("note"),
             "created_at": datetime.utcnow().isoformat(),
-            "owner_email": self.owner_email
+            "owner_email": self.owner_email,
         }]
         resp = self._post("/clients", payload, prefer="return=representation")
         return resp[0]["id"]
@@ -312,7 +427,31 @@ class SupabaseBackend(Backend):
                 payload[k] = data.get(k)
         if not payload:
             return
-        self._patch("/clients", payload, params={"id": f"eq.{client_id}"}, prefer="return=minimal")
+        self._patch(
+            "/clients",
+            payload,
+            params={"id": f"eq.{client_id}"},
+            prefer="return=minimal",
+        )
+
+    def upsert_client(self, name, phone, payment_method, account, note):
+        """
+        Crear o actualizar cliente en Supabase por nombre (case-insensitive).
+        Devuelve el id.
+        """
+        existing = self.get_client_by_name_ci(name)
+        data = {
+            "name": name,
+            "phone": phone,
+            "payment_method": payment_method,
+            "account": account,
+            "note": note,
+        }
+        if existing:
+            self.update_client(existing["id"], data)
+            return existing["id"]
+        else:
+            return self.add_client(data)
 
     def delete_client(self, client_id):
         # borrar cascada manual (por si no hay ON DELETE CASCADE)
@@ -321,14 +460,13 @@ class SupabaseBackend(Backend):
         self._delete("/invoices", params={"client_id": f"eq.{client_id}"})
         self._delete("/clients", params={"id": f"eq.{client_id}"})
 
-
     # --------------- sessions ---------------
     def log_session(self, client_id, ts_iso, amount_int):
         payload = [{
             "client_id": client_id,
             "ts_iso": ts_iso,
             "amount_int": int(amount_int or DEFAULT_CLASE_COP),
-            "owner_email": self.owner_email
+            "owner_email": self.owner_email,
         }]
         resp = self._post("/sessions", payload, prefer="return=representation")
         return resp[0]["id"]
@@ -348,12 +486,11 @@ class SupabaseBackend(Backend):
         # Mapear nombre de cliente
         cmap = {c["id"]: c for c in self.list_clients()}
         for d in data:
-            d["client_name"] = cmap.get(d["client_id"], {}).get("name", "—")
+            d["client"] = cmap.get(d["client_id"], {}).get("name", "—")  # 👈 client
         return data
 
     def delete_session(self, session_id):
         self._delete("/sessions", params={"id": f"eq.{session_id}"})
-
 
     # --------------- monthly payments ---------------
     def get_month_payment(self, client_id, year, month):
@@ -379,9 +516,13 @@ class SupabaseBackend(Backend):
             "month": month,
             "paid": bool(paid),
             "paid_on_iso": paid_on_iso,
-            "owner_email": self.owner_email
+            "owner_email": self.owner_email,
         }]
-        self._post("/monthly_payments", payload, prefer="resolution=merge-duplicates,return=minimal")
+        self._post(
+            "/monthly_payments",
+            payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
 
 
 # ======================================================
@@ -407,8 +548,13 @@ def get_backend():
 
     if url and key:
         try:
-            return SupabaseBackend(url, key), "Supabase"
+            b = SupabaseBackend(url, key)
+            b.label = "Supabase"
+            return b
         except Exception:
             # Si algo falla (tablas/políticas), cae a SQLite
             pass
-    return SQLiteBackend(), "SQLite"
+
+    b = SQLiteBackend()
+    b.label = "SQLite"
+    return b
